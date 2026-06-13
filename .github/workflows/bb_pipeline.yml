@@ -1,0 +1,102 @@
+name: Bug Bounty Pipeline
+
+on:
+  # Manual trigger — run on-demand for a specific target
+  workflow_dispatch:
+    inputs:
+      target_domain:
+        description: "Root domain to scan (e.g. target.com)"
+        required: true
+      program_name:
+        description: "Program name (e.g. hackerone/target)"
+        required: true
+      phases:
+        description: "Comma-separated phases to run"
+        default: "recon,crawl,js,http,nuclei,report"
+      platform:
+        description: "Bug bounty platform"
+        default: "hackerone"
+
+  # Scheduled weekly run — set DEFAULT_TARGET and DEFAULT_PROGRAM in repo vars
+  schedule:
+    - cron: "0 2 * * 0"   # Sundays 02:00 UTC
+
+jobs:
+  bb-pipeline:
+    name: Run BB Pipeline
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # ── Checkout ─────────────────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Setup Go + ProjectDiscovery tools ─────────────────────────────────────
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install ProjectDiscovery tools
+        run: |
+          go install -v github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest
+          go install -v github.com/projectdiscovery/httpx/cmd/httpx@latest
+          go install -v github.com/projectdiscovery/katana/cmd/katana@latest
+          go install -v github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+          go install -v github.com/lc/gau/v2/cmd/gau@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      # ── Python ─────────────────────────────────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      # ── Configure AWS credentials ─────────────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      # ── Run pipeline ──────────────────────────────────────────────────────────
+      - name: Run BB Pipeline
+        env:
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+          SLACK_WEBHOOK_URL:  ${{ secrets.SLACK_WEBHOOK_URL }}
+          TARGET_DOMAIN:      ${{ github.event.inputs.target_domain  || vars.DEFAULT_TARGET }}
+          PROGRAM_NAME:       ${{ github.event.inputs.program_name   || vars.DEFAULT_PROGRAM }}
+          PHASES:             ${{ github.event.inputs.phases         || 'recon,crawl,js,http,nuclei,report' }}
+          PLATFORM:           ${{ github.event.inputs.platform       || 'hackerone' }}
+        run: |
+          python pipeline.py \
+            --domain    "$TARGET_DOMAIN"  \
+            --program   "$PROGRAM_NAME"   \
+            --platform  "$PLATFORM"       \
+            --phases    "$PHASES"
+
+      # ── Upload reports as artifacts ───────────────────────────────────────────
+      - name: Upload reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name:           bb-reports-${{ github.run_id }}
+          path:           reports/
+          retention-days: 30
+
+      # ── Upload nuclei templates ───────────────────────────────────────────────
+      - name: Upload generated templates
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name:           bb-templates-${{ github.run_id }}
+          path:           reports/templates/
+          retention-days: 30
+          if-no-files-found: ignore
