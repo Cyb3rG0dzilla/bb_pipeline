@@ -12,11 +12,17 @@ BEDROCK_HAIKU   = "anthropic.claude-3-haiku-20240307-v1:0"      # bulk triage
 SUPABASE_URL    = os.getenv("SUPABASE_URL")
 SUPABASE_KEY    = os.getenv("SUPABASE_KEY")
 
+# ── External tool binaries ────────────────────────────────────────────────────
+# 'httpx' collides with the Python 'httpx' package's own CLI entry point
+# (Click-based), which sits ahead of ~/bb_tools on PATH inside the venv.
+# Rename the ProjectDiscovery binary to 'pdhttpx' to disambiguate.
+HTTPX_BIN       = os.getenv("HTTPX_BIN", "pdhttpx")
+
 # ── Optional alerts ───────────────────────────────────────────────────────────
 SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK_URL")
 
 # ── Pipeline limits ───────────────────────────────────────────────────────────
-MAX_SUBDOMAINS          = 500   # cap per program to avoid runaway scans
+MAX_SUBDOMAINS          = 5000  # cap per program to avoid runaway scans
 MAX_ENDPOINTS           = 1000  # cap for HTTP triage
 MAX_JS_FILES            = 100   # cap for JS analysis per run
 MAX_JS_CHARS            = 14000 # ~3.5k tokens — safe Haiku input size
