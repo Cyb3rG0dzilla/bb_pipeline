@@ -12,7 +12,7 @@ on:
         required: true
       phases:
         description: "Comma-separated phases to run"
-        default: "recon,crawl,js,http,nuclei,report"
+        default: "recon,crawl,params,js,http,nuclei,report"
       platform:
         description: "Bug bounty platform"
         default: "hackerone"
@@ -49,6 +49,17 @@ jobs:
           # (Click-based entry point installed via requirements.txt)
           mv $HOME/go/bin/httpx $HOME/go/bin/pdhttpx
           echo "$HOME/go/bin" >> $GITHUB_PATH
+
+      - name: Install Amass (optional passive subdomain source)
+        run: |
+          AMASS_URL=$(curl -s https://api.github.com/repos/owasp-amass/amass/releases/latest \
+            | grep -o '"browser_download_url": *"[^"]*linux_amd64.zip"' \
+            | head -1 | cut -d'"' -f4)
+          curl -sL "$AMASS_URL" -o amass.zip
+          unzip -o -q amass.zip -d amass_extracted
+          find amass_extracted -name amass -type f -exec mv {} $HOME/go/bin/amass \;
+          chmod +x $HOME/go/bin/amass
+          rm -rf amass.zip amass_extracted
 
       # ── Python ─────────────────────────────────────────────────────────────────
       - name: Setup Python

@@ -13,8 +13,10 @@ Usage:
   # Multiple domains from a file (one per line, # comments allowed)
   python pipeline.py --program "h1/target" --domains-file scope.txt
 
-  # Specific phases only
-  python pipeline.py --program "h1/target" --domain target.com --phases recon,crawl,js,http,nuclei,report
+  # Specific phases only — 'params' (Arjun) is opt-in: expensive per-endpoint,
+  # not in the default set
+  python pipeline.py --program "h1/target" --domain target.com \
+    --phases recon,crawl,params,js,http,nuclei,report
 """
 
 import click
@@ -30,7 +32,7 @@ import db
 
 console = Console()
 
-VALID_PHASES = ["recon", "crawl", "js", "http", "nuclei", "report"]
+VALID_PHASES = ["recon", "crawl", "params", "js", "http", "nuclei", "report"]
 
 
 def validate_phases(phases_str: str) -> list[str]:
@@ -141,7 +143,10 @@ def main(program, domain, domains_file, platform, phases, subdomains_file, urls_
                 with open(subdomains_file) as f:
                     subdomains = [l.strip() for l in f if l.strip()]
             else:
-                subdomains = recon_module.run_subfinder(current_domain)
+                sf_subs    = recon_module.run_subfinder(current_domain)
+                amass_subs = recon_module.run_amass(current_domain)
+                subdomains = recon_module.merge_and_cap_subdomains(sf_subs, amass_subs)
+                console.print(f"  Combined unique subdomains: [bold]{len(subdomains)}[/bold]")
 
             if not subdomains:
                 console.print(f"  [yellow]No subdomains found — using root domain only[/yellow]")
@@ -184,6 +189,18 @@ def main(program, domain, domains_file, platform, phases, subdomains_file, urls_
             js_urls     = recon_module.extract_js_urls(domain_urls)
             domain_urls = recon_module.prioritize_endpoints(domain_urls)
             console.print(f"  Total unique endpoints: [bold]{len(domain_urls)}[/bold]")
+
+        # ── PHASE: PARAM DISCOVERY — Arjun (opt-in, expensive per-endpoint) ──────
+        if "params" in phases:
+            console.print(Rule("[bold]Phase: Param Discovery (Arjun)[/bold]"))
+            if not domain_urls:
+                console.print("  [yellow]No endpoints — run crawl phase first[/yellow]")
+            else:
+                param_map = recon_module.run_arjun(domain_urls)
+                augmented = recon_module.build_arjun_augmented_urls(param_map)
+                if augmented:
+                    console.print(f"  +{len(augmented)} param-augmented URL(s) queued for HTTP triage")
+                    domain_urls = domain_urls + augmented
 
         # ── PHASE 3: JS ANALYSIS — Bedrock Haiku ─────────────────────────────────
         if "js" in phases:

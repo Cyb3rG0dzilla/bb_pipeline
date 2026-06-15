@@ -1,11 +1,14 @@
 import subprocess
 import json
+import re
 import shutil
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlsplit, urlunsplit, parse_qsl, urlencode
 from rich.console import Console
 from config import (
     MAX_SUBDOMAINS, MAX_ENDPOINTS, SKIP_EXTENSIONS,
-    INTERESTING_PATTERNS, JS_SKIP_PATTERNS, HTTPX_BIN
+    INTERESTING_PATTERNS, JS_SKIP_PATTERNS, HTTPX_BIN,
+    AMASS_TIMEOUT, MAX_ARJUN_TARGETS, ARJUN_THREADS,
+    ARJUN_REQUEST_TIMEOUT, ARJUN_TIMEOUT, ARJUN_PARAM_VALUE
 )
 
 console = Console()
@@ -61,6 +64,52 @@ def run_subfinder(domain: str) -> list[str]:
         subs = subs[:MAX_SUBDOMAINS]
     console.print(f"  Found [bold]{len(subs)}[/bold] subdomains")
     return subs
+
+
+_FQDN_RE_CACHE: dict[str, re.Pattern] = {}
+
+
+def _subdomain_pattern(domain: str) -> re.Pattern:
+    """Regex matching `domain` or any `*.domain` token, with word boundaries
+    so e.g. 'evil-domain.com' or 'notdomain.com' don't false-match 'domain.com'."""
+    if domain not in _FQDN_RE_CACHE:
+        _FQDN_RE_CACHE[domain] = re.compile(
+            r'\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*'
+            + re.escape(domain) + r'\b',
+            re.IGNORECASE
+        )
+    return _FQDN_RE_CACHE[domain]
+
+
+def run_amass(domain: str) -> list[str]:
+    """
+    Passive subdomain enum via OWASP Amass — uses a different source mix than
+    subfinder, so it often surfaces additional names. 'amass enum -passive -d'
+    is the well-documented base command; everything past that is handled
+    defensively (see config.AMASS_TIMEOUT comment): no -silent flag is passed
+    (unconfirmed for v4), output is parsed via regex regardless of format
+    (v4 prints graph edges, not bare hostnames), and the subprocess timeout
+    (with partial-output capture) is the real time bound, not any amass flag.
+    """
+    if not _tool_available("amass"):
+        console.print("  [yellow]  ⚠ amass not found — skipping (optional)[/yellow]")
+        return []
+
+    console.print(f"  [cyan]amass[/cyan] → {domain} (passive)")
+    out = _run(["amass", "enum", "-passive", "-d", domain], timeout=AMASS_TIMEOUT)
+    pattern = _subdomain_pattern(domain)
+    subs = sorted({m.group(0).lower() for m in pattern.finditer(out)})
+    console.print(f"  Found [bold]{len(subs)}[/bold] subdomains (amass)")
+    return subs
+
+
+def merge_and_cap_subdomains(*lists: list[str]) -> list[str]:
+    """Union multiple subdomain lists, dedupe, cap to MAX_SUBDOMAINS."""
+    combined = sorted(set().union(*(set(l) for l in lists)))
+    if len(combined) > MAX_SUBDOMAINS:
+        console.print(f"  [yellow]Combined: capping {len(combined)} → {MAX_SUBDOMAINS}[/yellow]")
+        combined = combined[:MAX_SUBDOMAINS]
+    return combined
 
 
 # ── Live host probing ──────────────────────────────────────────────────────────
@@ -204,3 +253,79 @@ def prioritize_endpoints(urls: list[str]) -> list[str]:
         console.print(f"  [yellow]Capping {len(sorted_urls)} → {MAX_ENDPOINTS} endpoints[/yellow]")
         sorted_urls = sorted_urls[:MAX_ENDPOINTS]
     return sorted_urls
+
+
+# ── Hidden parameter discovery (Arjun) ──────────────────────────────────────────
+
+def run_arjun(urls: list[str]) -> dict[str, list[str]]:
+    """
+    Discover hidden GET parameters on the highest-priority endpoints via Arjun.
+    `urls` should already be prioritized — only the first MAX_ARJUN_TARGETS are
+    probed (each costs ~50-60 requests with Arjun's default wordlist).
+    Returns {url: [param_name, ...]}. Confirmed -oJ format:
+    {"<url>": {"method": "...", "params": [{"name": "...", "reason": "..."}]}}
+    """
+    if not urls:
+        return {}
+
+    if not _tool_available("arjun"):
+        console.print("  [yellow]  ⚠ arjun not found — skipping (optional)[/yellow]")
+        return {}
+
+    targets = urls[:MAX_ARJUN_TARGETS]
+    console.print(f"  [cyan]arjun[/cyan] → {len(targets)} endpoint(s) "
+                  f"(~{len(targets) * 60} req budget)")
+
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("\n".join(targets))
+        tmp_in = f.name
+    tmp_out = tempfile.mktemp(suffix=".json")
+
+    try:
+        _run([
+            "arjun", "-i", tmp_in, "-oJ", tmp_out,
+            "-t", str(ARJUN_THREADS),
+            "-T", str(ARJUN_REQUEST_TIMEOUT),
+            "--stable",
+        ], timeout=ARJUN_TIMEOUT)
+    finally:
+        os.unlink(tmp_in)
+
+    results: dict[str, list[str]] = {}
+    if os.path.exists(tmp_out):
+        try:
+            with open(tmp_out) as f:
+                data = json.load(f)
+            for url, info in data.items():
+                params = [p.get("name") for p in info.get("params", []) if p.get("name")]
+                if params:
+                    results[url] = params
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        finally:
+            os.unlink(tmp_out)
+
+    console.print(f"  Params found on [bold]{len(results)}[/bold]/{len(targets)} endpoint(s)")
+    return results
+
+
+def build_arjun_augmented_urls(param_map: dict[str, list[str]]) -> list[str]:
+    """
+    For each discovered hidden param, build a URL with that param appended
+    (?param=ARJUN_PARAM_VALUE) so HTTP triage can inspect the *changed*
+    response — this is what surfaces e.g. ?debug=1 or ?role=admin behavior.
+    """
+    augmented = []
+    for url, params in param_map.items():
+        parts = urlsplit(url)
+        existing = dict(parse_qsl(parts.query))
+        for p in params:
+            if p in existing:
+                continue
+            new_q = {**existing, p: ARJUN_PARAM_VALUE}
+            augmented.append(urlunsplit((
+                parts.scheme, parts.netloc, parts.path,
+                urlencode(new_q), parts.fragment
+            )))
+    return augmented

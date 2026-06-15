@@ -22,7 +22,7 @@ HTTPX_BIN       = os.getenv("HTTPX_BIN", "pdhttpx")
 SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK_URL")
 
 # ── Pipeline limits ───────────────────────────────────────────────────────────
-MAX_SUBDOMAINS          = 5000  # cap per program to avoid runaway scans
+MAX_SUBDOMAINS          = 500   # cap per program to avoid runaway scans
 MAX_ENDPOINTS           = 1000  # cap for HTTP triage
 MAX_JS_FILES            = 100   # cap for JS analysis per run
 MAX_JS_CHARS            = 14000 # ~3.5k tokens — safe Haiku input size
@@ -59,3 +59,19 @@ INTERESTING_PATTERNS = [
     "/upload", "/export", "/import", "/download",
     "/token", "/auth", "/oauth", "/callback", "/webhook"
 ]
+
+# ── Amass (optional passive subdomain source) ─────────────────────────────────
+# v4 'enum' prints graph edges, not one-FQDN-per-line, and has no confirmed
+# -silent/time-limit flag (and documented hang issues on some setups) — so we
+# bound it purely via subprocess timeout (partial output is kept on kill) and
+# regex-extract any *.{domain} tokens from whatever it prints.
+AMASS_TIMEOUT = 120  # seconds
+
+# ── Arjun (optional hidden-parameter discovery) ───────────────────────────────
+# Expensive per-URL (~50-60 requests with the default wordlist) — capped hard
+# and run only when 'params' is explicitly included in --phases.
+MAX_ARJUN_TARGETS     = 20    # top-N prioritized endpoints to probe
+ARJUN_THREADS         = 5     # concurrent requests (-t)
+ARJUN_REQUEST_TIMEOUT = 10    # per-HTTP-request timeout, seconds (-T)
+ARJUN_TIMEOUT         = 600   # subprocess-level overall timeout, seconds
+ARJUN_PARAM_VALUE     = "1"   # value used when re-requesting with a discovered param
